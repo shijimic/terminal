@@ -1,0 +1,25 @@
+[package]
+name = "taida-lang-terminal"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Taida Lang terminal package — addon-backed TTY capability."
+repository = "https://github.com/taida-lang/terminal"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+taida-addon = { git = "https://github.com/taida-lang/taida.git" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# For local development, create .cargo/config.toml to override with a local checkout:
+#   [patch."https://github.com/taida-lang/taida.git"]
+#   taida-addon = { path = "../taida/crates/addon-rs" }
+
+[workspace]

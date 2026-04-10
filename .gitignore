@@ -1,0 +1,15 @@
+# Rust build output
+target/
+
+# Taida build artifacts (regeneratable)
+.taida/deps/
+.taida/build/
+.taida/graph/
+
+# Addon cdylib build artifacts in native/ (regeneratable via cargo build)
+native/*.so
+native/*.dylib
+native/*.dll
+
+# Cargo local config (developer-specific overrides)
+.cargo/

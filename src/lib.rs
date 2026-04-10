@@ -1,0 +1,687 @@
+//! `taida-lang-terminal` — terminal package implementation.
+//!
+//! This crate is the production `taida-lang/terminal` package. The v1
+//! surface is frozen in `.dev/RC2_DESIGN.md` in the main `taida`
+//! repository:
+//!
+//! - `terminalSize()` → `@(cols: Int, rows: Int)`
+//! - `readKey()` → `@(kind: KeyKind, text: Str, ctrl: Bool, alt: Bool, shift: Bool)`
+//! - `isTerminal(stream)` → `Bool`
+//!
+//! Phase 2 landed `readKey()` with the full RAII raw-mode lifecycle
+//! mandated by `RC2_BLOCKERS.md` RC2B-202. The decoder lives in
+//! [`key`] so unit tests can drive it without a real TTY.
+//!
+//! Phase 3 lands `terminalSize()` with the non-TTY / ioctl /
+//! degenerate-zero contract mandated by RC2B-203. The probe lives in
+//! [`size`] and is driven through the same host-builder bridge as
+//! `readKey`.
+//!
+//! Non-unix targets compile but every function returns `Error`. The
+//! Native loader rejects non-native backends at import time via the
+//! RC1 `addon::backend_policy` (no runtime fallback).
+
+#![deny(unsafe_op_in_unsafe_fn)]
+
+#[cfg(unix)]
+mod event;
+#[cfg(unix)]
+mod key;
+#[cfg(unix)]
+mod raw_mode;
+#[cfg(unix)]
+mod size;
+#[cfg(unix)]
+mod tty;
+
+#[cfg(windows)]
+mod windows;
+
+use core::ffi::c_char;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+use taida_addon::{
+    TaidaAddonErrorV1, TaidaAddonFunctionV1, TaidaAddonStatus, TaidaAddonValueV1, TaidaHostV1,
+};
+
+/// Captured host callback table. Populated by `terminal_init` and read
+/// by per-call entry points.
+static HOST_PTR: AtomicPtr<TaidaHostV1> = AtomicPtr::new(core::ptr::null_mut());
+
+extern "C" fn terminal_init(host: *const TaidaHostV1) -> TaidaAddonStatus {
+    if host.is_null() {
+        return TaidaAddonStatus::NullPointer;
+    }
+    HOST_PTR.store(host as *mut _, Ordering::Release);
+    TaidaAddonStatus::Ok
+}
+
+// ── terminalSize (Phase 3) ───────────────────────────────────────
+
+extern "C" fn terminal_size(
+    _args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 0 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        // Phase 3 body. Owns the isatty + ioctl(TIOCGWINSZ) probe and
+        // the deterministic error variants (`TerminalSizeNotATty`,
+        // `TerminalSizeIoctl`). See `size.rs`.
+        size::terminal_size_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::terminal_size_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── readKey (Phase 2) ────────────────────────────────────────────
+
+extern "C" fn read_key(
+    _args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 0 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        // The real Phase 2 body. Owns the raw-mode RAII guard,
+        // catch_unwind, non-TTY detection, and escape-sequence
+        // decoding. See `key.rs`.
+        key::read_key_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::read_key_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── isTerminal (TM-2c) ───────────────────────────────────────────
+
+extern "C" fn is_terminal(
+    args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 1 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        tty::is_terminal_impl(host_ptr, args_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::is_terminal_impl(host_ptr, args_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = args_ptr;
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── rawModeEnter (TM-2d) ────────────────────────────────────────
+
+extern "C" fn raw_mode_enter(
+    _args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 0 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        raw_mode::raw_mode_enter_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::raw_mode_enter_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── rawModeLeave (TM-2d) ───────────────────────────────────────
+
+extern "C" fn raw_mode_leave(
+    _args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 0 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        raw_mode::raw_mode_leave_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::raw_mode_leave_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── readEvent (TM-3d) ──────────────────────────────────────────
+
+extern "C" fn read_event(
+    _args_ptr: *const TaidaAddonValueV1,
+    args_len: u32,
+    out_value: *mut *mut TaidaAddonValueV1,
+    out_error: *mut *mut TaidaAddonErrorV1,
+) -> TaidaAddonStatus {
+    if args_len != 0 {
+        return TaidaAddonStatus::ArityMismatch;
+    }
+    let host_ptr = HOST_PTR.load(Ordering::Acquire);
+    if host_ptr.is_null() {
+        return TaidaAddonStatus::InvalidState;
+    }
+
+    #[cfg(unix)]
+    {
+        event::read_event_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::read_event_impl(host_ptr, args_len, out_value, out_error)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = out_value;
+        let _ = out_error;
+        TaidaAddonStatus::Error
+    }
+}
+
+// ── Function table ───────────────────────────────────────────────
+
+/// Function table for the terminal package.
+///
+/// Existing entries stay append-only so already-published names keep
+/// their original shape.
+pub static TERMINAL_FUNCTIONS: &[TaidaAddonFunctionV1] = &[
+    TaidaAddonFunctionV1 {
+        name: c"terminalSize".as_ptr() as *const c_char,
+        arity: 0,
+        call: terminal_size,
+    },
+    TaidaAddonFunctionV1 {
+        name: c"readKey".as_ptr() as *const c_char,
+        arity: 0,
+        call: read_key,
+    },
+    TaidaAddonFunctionV1 {
+        name: c"isTerminal".as_ptr() as *const c_char,
+        arity: 1,
+        call: is_terminal,
+    },
+    TaidaAddonFunctionV1 {
+        name: c"rawModeEnter".as_ptr() as *const c_char,
+        arity: 0,
+        call: raw_mode_enter,
+    },
+    TaidaAddonFunctionV1 {
+        name: c"rawModeLeave".as_ptr() as *const c_char,
+        arity: 0,
+        call: raw_mode_leave,
+    },
+    TaidaAddonFunctionV1 {
+        name: c"readEvent".as_ptr() as *const c_char,
+        arity: 0,
+        call: read_event,
+    },
+];
+
+taida_addon::declare_addon! {
+    name: "taida-lang/terminal",
+    functions: TERMINAL_FUNCTIONS,
+    init: terminal_init,
+}
+
+/// Test-only re-exports.
+///
+/// `cargo test --test <name>` compiles integration tests in their own
+/// crate, so they cannot reach the private `terminal_init` callback or
+/// the function table entries directly. The Native loader uses the
+/// `taida_addon_get_v1` cdylib symbol; in-process tests use this
+/// module to drive the same handshake without going through `dlsym`.
+///
+/// This module is **not** part of the user-facing addon ABI — it
+/// exists purely so the Phase 2 non-TTY contract can be exercised
+/// from `tests/read_key_non_tty.rs` without spawning a real Native
+/// loader.
+#[doc(hidden)]
+pub mod __test_only {
+    use super::*;
+
+    /// Re-export the init callback used by `declare_addon!`.
+    pub fn init(host: *const TaidaHostV1) -> TaidaAddonStatus {
+        super::terminal_init(host)
+    }
+
+    /// Borrow the frozen function table.
+    pub fn functions() -> &'static [TaidaAddonFunctionV1] {
+        super::TERMINAL_FUNCTIONS
+    }
+}
+
+// ── Unit tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ffi::CStr;
+    use taida_addon::{TAIDA_ADDON_ABI_VERSION, TaidaAddonDescriptorV1};
+
+    unsafe extern "C" {
+        fn taida_addon_get_v1() -> *const TaidaAddonDescriptorV1;
+    }
+
+    #[test]
+    fn entry_symbol_returns_descriptor() {
+        let ptr = unsafe { taida_addon_get_v1() };
+        assert!(!ptr.is_null());
+        let d = unsafe { &*ptr };
+        assert_eq!(d.abi_version, TAIDA_ADDON_ABI_VERSION);
+    }
+
+    #[test]
+    fn descriptor_advertises_six_functions() {
+        let ptr = unsafe { taida_addon_get_v1() };
+        let d = unsafe { &*ptr };
+        assert_eq!(d.function_count as usize, TERMINAL_FUNCTIONS.len());
+        assert_eq!(d.function_count, 6);
+    }
+
+    #[test]
+    fn descriptor_addon_name_is_terminal() {
+        let ptr = unsafe { taida_addon_get_v1() };
+        let d = unsafe { &*ptr };
+        let name = unsafe { CStr::from_ptr(d.addon_name) };
+        assert_eq!(name.to_str().unwrap(), "taida-lang/terminal");
+    }
+
+    #[test]
+    fn function_table_v1_entries_are_stable() {
+        // The first three entries are the v1 lock: position, name, and
+        // arity must never change. New entries are appended after them.
+        let v1_expected: Vec<(String, u32)> = vec![
+            ("terminalSize".to_string(), 0u32),
+            ("readKey".to_string(), 0),
+            ("isTerminal".to_string(), 1),
+        ];
+        let ptr = unsafe { taida_addon_get_v1() };
+        let d = unsafe { &*ptr };
+        let mut seen = Vec::new();
+        for i in 0..d.function_count as isize {
+            let f = unsafe { &*d.functions.offset(i) };
+            let name = unsafe { CStr::from_ptr(f.name) }.to_str().unwrap();
+            seen.push((name.to_string(), f.arity));
+        }
+        // v1 entries must be at the same positions.
+        assert_eq!(&seen[..3], &v1_expected[..]);
+        // Full table includes v1 + Phase 2 + Phase 3 additions.
+        let full_expected: Vec<(String, u32)> = vec![
+            ("terminalSize".to_string(), 0u32),
+            ("readKey".to_string(), 0),
+            ("isTerminal".to_string(), 1),
+            ("rawModeEnter".to_string(), 0),
+            ("rawModeLeave".to_string(), 0),
+            ("readEvent".to_string(), 0),
+        ];
+        assert_eq!(seen, full_expected);
+    }
+
+    #[test]
+    fn terminal_size_returns_invalid_state_when_host_not_initialised() {
+        // Phase 3: terminal_size forwards to size::terminal_size_impl
+        // after the arity check. With no `terminal_init` call (and
+        // therefore no captured host pointer), the implementation
+        // must report InvalidState rather than dereference a null
+        // host. The deeper non-TTY / ioctl behaviour is exercised by
+        // the unit tests in `size.rs` which drive `probe_terminal_size`
+        // directly.
+        let f = &TERMINAL_FUNCTIONS[0];
+        // Snapshot and clear the global so a previous test that
+        // captured a real host pointer can't perturb us.
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        // Restore for other tests that might rely on it.
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn read_key_returns_invalid_state_when_host_not_initialised() {
+        // Phase 2: read_key forwards to key::read_key_impl after the
+        // arity check. With no `terminal_init` call (and therefore no
+        // captured host pointer), the implementation must report
+        // InvalidState rather than dereference a null host. The
+        // deeper raw-mode / non-TTY behaviour is exercised by the
+        // unit tests in `key.rs` which can drive a real pty.
+        let f = &TERMINAL_FUNCTIONS[1];
+        // Snapshot and clear the global so a previous test that
+        // captured a real host pointer can't perturb us.
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        // Restore for other tests that might rely on it.
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn is_terminal_returns_invalid_state_when_host_not_initialised() {
+        let f = &TERMINAL_FUNCTIONS[2];
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn terminal_size_arity_mismatch_when_args_given() {
+        let f = &TERMINAL_FUNCTIONS[0];
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    #[test]
+    fn read_key_arity_mismatch_when_args_given() {
+        let f = &TERMINAL_FUNCTIONS[1];
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    #[test]
+    fn is_terminal_arity_mismatch_when_args_missing() {
+        let f = &TERMINAL_FUNCTIONS[2];
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    #[test]
+    fn raw_mode_enter_returns_invalid_state_when_host_not_initialised() {
+        let f = &TERMINAL_FUNCTIONS[3];
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn raw_mode_enter_arity_mismatch_when_args_given() {
+        let f = &TERMINAL_FUNCTIONS[3];
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    #[test]
+    fn raw_mode_leave_returns_invalid_state_when_host_not_initialised() {
+        let f = &TERMINAL_FUNCTIONS[4];
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn raw_mode_leave_arity_mismatch_when_args_given() {
+        let f = &TERMINAL_FUNCTIONS[4];
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    #[test]
+    fn read_event_returns_invalid_state_when_host_not_initialised() {
+        let f = &TERMINAL_FUNCTIONS[5];
+        let prev = HOST_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let status = (f.call)(
+            core::ptr::null(),
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        HOST_PTR.store(prev, Ordering::Release);
+        assert_eq!(status, TaidaAddonStatus::InvalidState);
+    }
+
+    #[test]
+    fn read_event_arity_mismatch_when_args_given() {
+        let f = &TERMINAL_FUNCTIONS[5];
+        let status = (f.call)(
+            core::ptr::null(),
+            1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        assert_eq!(status, TaidaAddonStatus::ArityMismatch);
+    }
+
+    // ── Cross-platform capability error contract (TM-6f) ────────
+
+    /// Error code ranges are frozen and must be identical across platforms.
+    /// - ReadKey:       1001-1006
+    /// - TerminalSize:  2001-2003
+    /// - IsTerminal:    2101-2102
+    /// - RawMode:       3001-3005
+    /// - ReadEvent:     4001-4007
+    #[test]
+    #[cfg(unix)]
+    fn error_code_ranges_are_frozen_unix() {
+        use crate::event::err as ee;
+        use crate::key::err as ke;
+        use crate::raw_mode::err as re;
+        use crate::size::err as se;
+        use crate::tty::err as te;
+
+        // ReadKey error codes
+        assert_eq!(ke::READ_KEY_NOT_A_TTY, 1001);
+        assert_eq!(ke::READ_KEY_RAW_MODE, 1002);
+        assert_eq!(ke::READ_KEY_EOF, 1003);
+        assert_eq!(ke::READ_KEY_INTERRUPTED, 1004);
+        assert_eq!(ke::READ_KEY_PANIC, 1005);
+        assert_eq!(ke::READ_KEY_INVALID_STATE, 1006);
+
+        // TerminalSize error codes
+        assert_eq!(se::TERMINAL_SIZE_NOT_A_TTY, 2001);
+        assert_eq!(se::TERMINAL_SIZE_IOCTL, 2002);
+
+        // IsTerminal error codes
+        assert_eq!(te::IS_TERMINAL_INVALID_STREAM, 2101);
+        assert_eq!(te::IS_TERMINAL_BUILD_VALUE, 2102);
+
+        // RawMode error codes
+        assert_eq!(re::RAW_MODE_NOT_A_TTY, 3001);
+        assert_eq!(re::RAW_MODE_ALREADY_ACTIVE, 3002);
+        assert_eq!(re::RAW_MODE_NOT_ACTIVE, 3003);
+        assert_eq!(re::RAW_MODE_ENTER_FAILED, 3004);
+        assert_eq!(re::RAW_MODE_LEAVE_FAILED, 3005);
+
+        // ReadEvent error codes
+        assert_eq!(ee::READ_EVENT_NOT_IN_RAW_MODE, 4001);
+        assert_eq!(ee::READ_EVENT_NOT_A_TTY, 4002);
+        assert_eq!(ee::READ_EVENT_READ_FAILED, 4003);
+        assert_eq!(ee::READ_EVENT_EOF, 4004);
+        assert_eq!(ee::READ_EVENT_INTERRUPTED, 4005);
+        assert_eq!(ee::READ_EVENT_PANIC, 4006);
+        assert_eq!(ee::READ_EVENT_RESIZE_INIT_FAILED, 4007);
+    }
+
+    /// Cross-platform error name contract: the Taida-side error type names
+    /// must follow the `{API prefix}{Suffix}` convention documented in
+    /// TM_DESIGN.md. This test locks the mapping.
+    #[test]
+    fn error_name_convention_lock() {
+        // These are the exact Taida-side error type names returned by the
+        // addon. Adding or renaming requires updating TM_DESIGN.md.
+        let expected = [
+            // IsTerminal
+            "IsTerminalInvalidStream",
+            "IsTerminalBuildValue",
+            // TerminalSize
+            "TerminalSizeNotATty",
+            "TerminalSizeIoctl",
+            // ReadKey
+            "ReadKeyNotATty",
+            "ReadKeyRawMode",
+            "ReadKeyEof",
+            "ReadKeyInterrupted",
+            "ReadKeyPanic",
+            "ReadKeyInvalidState",
+            // RawMode
+            "RawModeNotATty",
+            "RawModeAlreadyActive",
+            "RawModeNotActive",
+            "RawModeEnterFailed",
+            "RawModeLeaveFailed",
+            // ReadEvent
+            "ReadEventNotInRawMode",
+            "ReadEventNotATty",
+            "ReadEventReadFailed",
+            "ReadEventEof",
+            "ReadEventInterrupted",
+            "ReadEventPanic",
+            "ReadEventResizeInitFailed",
+            // Windows-only (capability init)
+            "TerminalSizeUnsupported",
+            "ReadKeyUnsupported",
+        ];
+        // Verify no duplicates.
+        let mut sorted = expected.to_vec();
+        sorted.sort();
+        for i in 0..sorted.len() - 1 {
+            assert_ne!(
+                sorted[i],
+                sorted[i + 1],
+                "duplicate error name: {}",
+                sorted[i]
+            );
+        }
+        // Count is the contract — adding a new error must update this.
+        assert_eq!(expected.len(), 24);
+    }
+}

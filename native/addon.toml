@@ -1,0 +1,22 @@
+abi = 1
+entry = "taida_addon_get_v1"
+package = "taida-lang/terminal"
+library = "taida_lang_terminal"
+
+[functions]
+terminalSize = 0
+readKey = 0
+isTerminal = 1
+rawModeEnter = 0
+rawModeLeave = 0
+readEvent = 0
+
+[library.prebuild]
+url = "https://github.com/taida-lang/terminal/releases/download/{version}/lib{name}-{target}.{ext}"
+
+[library.prebuild.targets]
+x86_64-unknown-linux-gnu = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+aarch64-unknown-linux-gnu = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+x86_64-apple-darwin = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+aarch64-apple-darwin = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+x86_64-pc-windows-msvc = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
