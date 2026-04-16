@@ -85,16 +85,15 @@ _isControl cp =
 ///@ Returns: @(width <= 0, mode <= WidthMode.Narrow)
 ///@ Since: a.6
 MeasureGrapheme text =
-  | text == "" |> @(width <= 0, mode <= WidthMode.Zero)
-  | _ |> _measureGraphemeInner(text)
+  If[text == "", @(width <= 0, mode <= WidthMode.Zero), _measureGraphemeInner(text)]()
 => :@(width: Int, mode: Int)
 
 _measureGraphemeInner text =
-  _ch <=[ CharAt[text, 0]()
-  _cp <=[ CodePoint[_ch]()
-  | _isControl(_cp) == true  |> @(width <= 0, mode <= WidthMode.Zero)
-  | _isCombining(_cp) == true |> @(width <= 0, mode <= WidthMode.Zero)
-  | _isWide(_cp) == true     |> @(width <= 2, mode <= WidthMode.Wide)
+  ch <=[ CharAt[text, 0]()
+  cp <=[ CodePoint[ch]()
+  | _isControl(cp) == true  |> @(width <= 0, mode <= WidthMode.Zero)
+  | _isCombining(cp) == true |> @(width <= 0, mode <= WidthMode.Zero)
+  | _isWide(cp) == true     |> @(width <= 2, mode <= WidthMode.Wide)
   | _ |> @(width <= 1, mode <= WidthMode.Narrow)
 => :@(width: Int, mode: Int)
 
@@ -110,17 +109,16 @@ _measureGraphemeInner text =
 _dwCalc src idx acc len =
   | idx == len |> acc
   | _ |>
-    CharAt[src, idx]() ]=> _ch
-    CodePoint[_ch]() ]=> _cp
-    _step <= | _cp > 65535 |> 2
-             | _ |> 1
-    _m <= MeasureGrapheme(_ch)
-    _dwCalc(src, idx + _step, acc + _m.width, len)
+    CharAt[src, idx]() ]=> ch
+    CodePoint[ch]() ]=> cp
+    step <= | cp > 65535 |> 2
+            | _ |> 1
+    m <= MeasureGrapheme(ch)
+    _dwCalc(src, idx + step, acc + m.width, len)
 => :Int
 
 DisplayWidth text =
-  | text == "" |> 0
-  | _ |> _dwCalc(text, 0, 0, text.length())
+  If[text == "", 0, _dwCalc(text, 0, 0, text.length())]()
 => :Int
 
 // -- NormalizeCellText --
@@ -133,22 +131,20 @@ DisplayWidth text =
 _normLoop src idx acc len =
   | idx == len |> acc
   | _ |>
-    CharAt[src, idx]() ]=> _ch
-    _nextAcc <= | _ch == "\t" |> acc + "    "
-                | _ch == "\n" |> acc
-                | _ch == "\r" |> acc
-                | _ |> acc + _ch
-    _normLoop(src, idx + 1, _nextAcc, len)
+    CharAt[src, idx]() ]=> ch
+    nextAcc <= | ch == "\t" |> acc + "    "
+               | ch == "\n" |> acc
+               | ch == "\r" |> acc
+               | _ |> acc + ch
+    _normLoop(src, idx + 1, nextAcc, len)
 => :Str
 
 _normFinish result =
-  | result == "" |> " "
-  | _ |> result
+  If[result == "", " ", result]()
 => :Str
 
 NormalizeCellText text =
-  | text == "" |> " "
-  | _ |> _normFinish(_normLoop(text, 0, "", text.length()))
+  If[text == "", " ", _normFinish(_normLoop(text, 0, "", text.length()))]()
 => :Str
 
 // -- TruncateWidth --
@@ -163,13 +159,13 @@ _twLoop src idx acc remaining len =
   | idx == len |> acc
   | remaining < 1 |> acc
   | _ |>
-    CharAt[src, idx]() ]=> _ch
-    CodePoint[_ch]() ]=> _cp
-    _step <= | _cp > 65535 |> 2
-             | _ |> 1
-    _m <= MeasureGrapheme(_ch)
-    | _m.width > remaining |> acc
-    | _ |> _twLoop(src, idx + _step, acc + _ch, remaining - _m.width, len)
+    CharAt[src, idx]() ]=> ch
+    CodePoint[ch]() ]=> cp
+    step <= | cp > 65535 |> 2
+            | _ |> 1
+    m <= MeasureGrapheme(ch)
+    | m.width > remaining |> acc
+    | _ |> _twLoop(src, idx + step, acc + ch, remaining - m.width, len)
 => :Str
 
 TruncateWidth text width =
@@ -192,10 +188,10 @@ _padLoop s remaining =
 => :Str
 
 PadWidth text width =
-  _current <= DisplayWidth(text)
-  | _current > width |> text
-  | _current == width |> text
-  | _ |> _padLoop(text, width - _current)
+  current <= DisplayWidth(text)
+  | current > width |> text
+  | current == width |> text
+  | _ |> _padLoop(text, width - current)
 => :Str
 
 <<< @(WidthMode, MeasureGrapheme, DisplayWidth, NormalizeCellText, TruncateWidth, PadWidth)

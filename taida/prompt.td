@@ -96,25 +96,23 @@ _KK_End        <= 11
 // -- Internal: string manipulation helpers --
 
 _insertAt s pos ch =
-  _left <=[ Slice[s, 0, pos]()
-  _right <=[ Slice[s, pos, s.length()]()
-  _left + ch + _right
+  left <=[ Slice[s, 0, pos]()
+  right <=[ Slice[s, pos, s.length()]()
+  left + ch + right
 => :Str
 
 _deleteAt s pos =
-  | pos < 0 |> s
-  | _ |> _deleteAtInner(s, pos)
+  If[pos < 0, s, _deleteAtInner(s, pos)]()
 => :Str
 
 _deleteAtInner s pos =
-  | pos == s.length() |> s
-  | _ |> _deleteAtDo(s, pos)
+  If[pos == s.length(), s, _deleteAtDo(s, pos)]()
 => :Str
 
 _deleteAtDo s pos =
-  _left <=[ Slice[s, 0, pos]()
-  _right <=[ Slice[s, pos + 1, s.length()]()
-  _left + _right
+  left <=[ Slice[s, 0, pos]()
+  right <=[ Slice[s, pos + 1, s.length()]()
+  left + right
 => :Str
 
 // -- Internal: make state with new values helper --
@@ -132,9 +130,7 @@ _makeStateHist text cursor state histIdx histSaved action =
 ///@ Purpose: Process one key event and return the next state
 ///@ Since: a.7
 LineEditorStep state key =
-  | state.action == LineEditorAction.Editing |>
-    _stepEditing(state, key)
-  | _ |> state
+  If[state.action == LineEditorAction.Editing, _stepEditing(state, key), state]()
 => :@()
 
 _stepEditing state key =
@@ -153,77 +149,72 @@ _stepEditing state key =
 => :@()
 
 _stepArrowLeft state =
-  _nc <= | state.cursor > 0 |> state.cursor - 1
-         | _ |> 0
-  _makeState(state.text, _nc, state, LineEditorAction.Editing)
+  nc <= | state.cursor > 0 |> state.cursor - 1
+        | _ |> 0
+  _makeState(state.text, nc, state, LineEditorAction.Editing)
 => :@()
 
 _stepArrowRight state =
-  _nc <= | state.cursor < state.text.length() |> state.cursor + 1
-         | _ |> state.text.length()
-  _makeState(state.text, _nc, state, LineEditorAction.Editing)
+  nc <= | state.cursor < state.text.length() |> state.cursor + 1
+        | _ |> state.text.length()
+  _makeState(state.text, nc, state, LineEditorAction.Editing)
 => :@()
 
 _stepBackspace state =
-  | state.cursor == 0 |> state
-  | _ |> _stepBackspaceDo(state)
+  If[state.cursor == 0, state, _stepBackspaceDo(state)]()
 => :@()
 
 _stepBackspaceDo state =
-  _newText <= _deleteAt(state.text, state.cursor - 1)
-  _makeState(_newText, state.cursor - 1, state, LineEditorAction.Editing)
+  newText <= _deleteAt(state.text, state.cursor - 1)
+  _makeState(newText, state.cursor - 1, state, LineEditorAction.Editing)
 => :@()
 
 _stepDelete state =
-  | state.cursor == state.text.length() |> state
-  | _ |> _stepDeleteDo(state)
+  If[state.cursor == state.text.length(), state, _stepDeleteDo(state)]()
 => :@()
 
 _stepDeleteDo state =
-  _newText <= _deleteAt(state.text, state.cursor)
-  _makeState(_newText, state.cursor, state, LineEditorAction.Editing)
+  newText <= _deleteAt(state.text, state.cursor)
+  _makeState(newText, state.cursor, state, LineEditorAction.Editing)
 => :@()
 
 _stepInsertChar state key =
-  | key.text == "" |> state
-  | _ |> _stepInsertCharDo(state, key)
+  If[key.text == "", state, _stepInsertCharDo(state, key)]()
 => :@()
 
 _stepInsertCharDo state key =
-  _newText <= _insertAt(state.text, state.cursor, key.text)
-  _makeState(_newText, state.cursor + key.text.length(), state, LineEditorAction.Editing)
+  newText <= _insertAt(state.text, state.cursor, key.text)
+  _makeState(newText, state.cursor + key.text.length(), state, LineEditorAction.Editing)
 => :@()
 
 _stepHistoryPrev state =
-  | state.history.length() == 0 |> state
-  | _ |> _stepHistoryPrevDo(state)
+  If[state.history.length() == 0, state, _stepHistoryPrevDo(state)]()
 => :@()
 
 _stepHistoryPrevDo state =
-  _newIdx <= | state.history_index == -1 |> state.history.length() - 1
-             | state.history_index > 0   |> state.history_index - 1
-             | _ |> 0
-  _saved <= | state.history_index == -1 |> state.text
-            | _ |> state.history_saved
-  state.history.get(_newIdx) ]=> _histText
-  _makeStateHist(_histText, _histText.length(), state, _newIdx, _saved, LineEditorAction.Editing)
+  newIdx <= | state.history_index == -1 |> state.history.length() - 1
+            | state.history_index > 0   |> state.history_index - 1
+            | _ |> 0
+  saved <= | state.history_index == -1 |> state.text
+           | _ |> state.history_saved
+  state.history.get(newIdx) ]=> histText
+  _makeStateHist(histText, histText.length(), state, newIdx, saved, LineEditorAction.Editing)
 => :@()
 
 _stepHistoryNext state =
-  | state.history_index == -1 |> state
-  | _ |> _stepHistoryNextDo(state)
+  If[state.history_index == -1, state, _stepHistoryNextDo(state)]()
 => :@()
 
 _stepHistoryNextDo state =
-  _newIdx <= state.history_index + 1
-  | _newIdx == state.history.length() |> _makeStateHist(state.history_saved, state.history_saved.length(), state, -1, "", LineEditorAction.Editing)
-  | _newIdx > state.history.length() |> _makeStateHist(state.history_saved, state.history_saved.length(), state, -1, "", LineEditorAction.Editing)
-  | _ |> _stepHistoryNextLoad(state, _newIdx)
+  newIdx <= state.history_index + 1
+  | newIdx == state.history.length() |> _makeStateHist(state.history_saved, state.history_saved.length(), state, -1, "", LineEditorAction.Editing)
+  | newIdx > state.history.length() |> _makeStateHist(state.history_saved, state.history_saved.length(), state, -1, "", LineEditorAction.Editing)
+  | _ |> _stepHistoryNextLoad(state, newIdx)
 => :@()
 
 _stepHistoryNextLoad state newIdx =
-  state.history.get(newIdx) ]=> _histText
-  _makeStateHist(_histText, _histText.length(), state, newIdx, state.history_saved, LineEditorAction.Editing)
+  state.history.get(newIdx) ]=> histText
+  _makeStateHist(histText, histText.length(), state, newIdx, state.history_saved, LineEditorAction.Editing)
 => :@()
 
 // -- LineEditorRender --
@@ -232,12 +223,12 @@ _stepHistoryNextLoad state newIdx =
 ///@ Returns: @(line <= "", cursor_col <= 1)
 ///@ Since: a.7
 LineEditorRender state =
-  _displayText <= _getDisplayText(state)
-  _promptWidth <= DisplayWidth(state.prompt)
-  _cursorDisplayPos <= | state.mode == PromptMode.Password |> state.cursor
-                       | _ |> _cursorWidthCalc(state)
-  _cursorCol <= _promptWidth + _cursorDisplayPos + 1
-  @(line <= ClearLine() + state.prompt + _displayText, cursor_col <= _cursorCol)
+  displayText <= _getDisplayText(state)
+  promptWidth <= DisplayWidth(state.prompt)
+  cursorDisplayPos <= | state.mode == PromptMode.Password |> state.cursor
+                      | _ |> _cursorWidthCalc(state)
+  cursorCol <= promptWidth + cursorDisplayPos + 1
+  @(line <= ClearLine() + state.prompt + displayText, cursor_col <= cursorCol)
 => :@()
 
 _getDisplayText state =
@@ -254,8 +245,8 @@ _maskLoop acc remaining =
 => :Str
 
 _cursorWidthCalc state =
-  _prefix <=[ Slice[state.text, 0, state.cursor]()
-  DisplayWidth(_prefix)
+  prefix <=[ Slice[state.text, 0, state.cursor]()
+  DisplayWidth(prefix)
 => :Int
 
 <<< @(PromptMode, PromptOptions, CompletionState, LineEditorAction, LineEditorState, LineEditorNew, LineEditorStep, LineEditorRender)
